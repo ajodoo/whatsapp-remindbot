@@ -1,6 +1,4 @@
-import sqlite3
-import os
-import logging
+import sqlite3, os, logging
 from datetime import datetime, timedelta
 
 DB_PATH = os.getenv("DB_PATH", "reminders.db")
@@ -20,14 +18,19 @@ def init_db():
                 remind_at   TEXT    NOT NULL,
                 repeat      TEXT,
                 status      TEXT    DEFAULT 'pending',
+                last_sent   TEXT,
                 created_at  TEXT    DEFAULT (datetime('now','localtime'))
             )
         """)
+        # Agregar columna last_sent si no existe (para DBs viejas)
+        try:
+            conn.execute("ALTER TABLE reminders ADD COLUMN last_sent TEXT")
+        except:
+            pass
         conn.commit()
     logging.info("DB lista")
 
-# ── Guardar un nuevo recordatorio ──────────────────────────────────────────────
-def save_reminder(phone: str, task: str, remind_at: str, repeat: str = None) -> int:
+def save_reminder(phone, task, remind_at, repeat=None):
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO reminders (phone, task, remind_at, repeat) VALUES (?,?,?,?)",
@@ -36,29 +39,43 @@ def save_reminder(phone: str, task: str, remind_at: str, repeat: str = None) -> 
         conn.commit()
         return cur.lastrowid
 
-# ── Recordatorios que ya vencieron y están pendientes ─────────────────────────
-def get_pending_reminders() -> list[dict]:
+def get_pending_reminders():
+    """Recordatorios que deben dispararse: vencidos Y (nunca enviados O enviados hace 30+ min)"""
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:00")
+    ago = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:00")
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM reminders WHERE status='pending' AND remind_at <= ?", (now,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT * FROM reminders
+            WHERE status IN ('pending','reminded')
+            AND remind_at <= ?
+            AND (last_sent IS NULL OR last_sent <= ?)
+        """, (now, ago)).fetchall()
     return [dict(r) for r in rows]
 
-# ── Estado: pendiente → avisado ───────────────────────────────────────────────
-def mark_reminded(reminder_id: int):
+def mark_reminded(reminder_id):
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:00")
     with get_conn() as conn:
-        conn.execute("UPDATE reminders SET status='reminded' WHERE id=?", (reminder_id,))
+        conn.execute(
+            "UPDATE reminders SET status='reminded', last_sent=? WHERE id=?",
+            (now, reminder_id)
+        )
         conn.commit()
 
-# ── Estado: avisado/pendiente → finalizado ────────────────────────────────────
-def mark_done(reminder_id: int):
+def mark_done(reminder_id):
     with get_conn() as conn:
         conn.execute("UPDATE reminders SET status='done' WHERE id=?", (reminder_id,))
         conn.commit()
 
-# ── Último recordatorio que se avisó (para el "finalizado") ───────────────────
-def get_last_reminded(phone: str) -> dict | None:
+def mark_done_by_phone(phone):
+    """Marca TODOS los recordatorios activos del usuario como finalizados"""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE reminders SET status='done' WHERE phone=? AND status IN ('pending','reminded')",
+            (phone,)
+        )
+        conn.commit()
+
+def get_last_reminded(phone):
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM reminders WHERE phone=? AND status='reminded' ORDER BY remind_at DESC LIMIT 1",
@@ -66,20 +83,24 @@ def get_last_reminded(phone: str) -> dict | None:
         ).fetchone()
     return dict(row) if row else None
 
-# ── Lista de pendientes del usuario ───────────────────────────────────────────
-def get_pending_for_user(phone: str) -> list[dict]:
+def get_reminded_by_id(reminder_id):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM reminders WHERE id=? AND status='reminded'", (reminder_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+def get_pending_for_user(phone):
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM reminders WHERE phone=? AND status='pending' ORDER BY remind_at ASC",
+            "SELECT * FROM reminders WHERE phone=? AND status IN ('pending','reminded') ORDER BY remind_at ASC",
             (phone,)
         ).fetchall()
     return [dict(r) for r in rows]
 
-# ── Programar la siguiente ocurrencia (para recordatorios repetitivos) ─────────
-def schedule_next(reminder: dict):
+def schedule_next(reminder):
     dt = datetime.fromisoformat(reminder["remind_at"])
     repeat = reminder.get("repeat")
-
     if repeat == "daily":
         next_dt = dt + timedelta(days=1)
     elif repeat == "weekly":
@@ -93,7 +114,5 @@ def schedule_next(reminder: dict):
             next_dt = dt.replace(year=y, month=m, day=28)
     else:
         return
-
     save_reminder(reminder["phone"], reminder["task"],
                   next_dt.strftime("%Y-%m-%dT%H:%M:00"), repeat)
-    logging.info(f"Próximo recordatorio programado: {next_dt}")

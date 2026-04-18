@@ -5,9 +5,10 @@ import os, logging
 from datetime import datetime
 
 from database     import (init_db, save_reminder, get_pending_reminders,
-                           mark_reminded, mark_done, get_last_reminded,
-                           get_pending_for_user, schedule_next)
-from whatsapp_api import send_message
+                           mark_reminded, mark_done, mark_done_by_phone,
+                           get_last_reminded, get_pending_for_user,
+                           get_reminded_by_id, schedule_next)
+from whatsapp_api import send_message, send_reminder_with_button
 from groq_parser  import transcribe_audio, parse_reminders
 
 load_dotenv()
@@ -34,7 +35,6 @@ LIST_WORDS = {
 def verify():
     if (request.args.get("hub.mode") == "subscribe" and
             request.args.get("hub.verify_token") == VERIFY_TOKEN):
-        logging.info("Webhook verificado ✓")
         return request.args.get("hub.challenge"), 200
     return "Forbidden", 403
 
@@ -54,20 +54,32 @@ def webhook():
         phone = msg["from"]
         mtype = msg.get("type", "")
 
-        # ── AUDIO: Whisper transcribe → LLaMA parsea ──────────────────────────
+        # ── Respuesta a botón interactivo ─────────────────────────────────────
+        if mtype == "interactive":
+            reply_id = (msg.get("interactive", {})
+                           .get("button_reply", {})
+                           .get("id", ""))
+            if reply_id.startswith("done_"):
+                reminder_id = int(reply_id.replace("done_", ""))
+                reminder = get_reminded_by_id(reminder_id)
+                if reminder:
+                    mark_done(reminder_id)
+                    send_message(phone, f"✅ *{reminder['task']}* marcado como finalizado.")
+                else:
+                    send_message(phone, "✅ Recordatorio finalizado.")
+            return "ok", 200
+
+        # ── Audio ─────────────────────────────────────────────────────────────
         if mtype == "audio":
             send_message(phone, "🎙️ Escuchando tu audio...")
-            media_id = msg["audio"]["id"]
-            text = transcribe_audio(media_id)
-
+            text = transcribe_audio(msg["audio"]["id"])
             if not text:
-                send_message(phone, "❌ No pude escuchar el audio. Intenta de nuevo o escríbelo.")
+                send_message(phone, "❌ No pude escuchar el audio. Intenta de nuevo.")
                 return "ok", 200
-
             _procesar_recordatorios(phone, text)
             return "ok", 200
 
-        # ── TEXTO ─────────────────────────────────────────────────────────────
+        # ── Texto ─────────────────────────────────────────────────────────────
         if mtype != "text":
             return "ok", 200
 
@@ -91,19 +103,17 @@ def webhook():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  LÓGICA COMPARTIDA
+#  LÓGICA
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _procesar_recordatorios(phone: str, text: str):
+def _procesar_recordatorios(phone, text):
     reminders = parse_reminders(text)
-
     if not reminders:
         send_message(phone,
             "No encontré recordatorios 🤔\n\n"
             "*Ejemplos:*\n"
             "• _Mañana a las 3pm llamar al proveedor_\n"
-            "• _El viernes 9am reunión con el equipo_\n"
-            "• _Mañana llevar documentos, en la tarde revisar campañas_")
+            "• _Hoy 6pm revisar campañas y en la noche clases de trading_")
         return
 
     for r in reminders:
@@ -123,7 +133,7 @@ def _procesar_recordatorios(phone: str, text: str):
         send_message(phone, "\n".join(lines))
 
 
-def _cmd_lista(phone: str):
+def _cmd_lista(phone):
     pending = get_pending_for_user(phone)
     if not pending:
         send_message(phone, "📭 No tienes recordatorios pendientes.")
@@ -136,31 +146,27 @@ def _cmd_lista(phone: str):
     send_message(phone, "\n".join(lines))
 
 
-def _cmd_finalizado(phone: str):
+def _cmd_finalizado(phone):
     reminder = get_last_reminded(phone)
     if reminder:
         mark_done(reminder["id"])
         send_message(phone, f"✅ *{reminder['task']}* marcado como finalizado.")
     else:
-        send_message(phone,
-            "No encontré ningún recordatorio activo.\n"
-            "¿Quieres crear uno? Escríbeme o mándame un audio.")
+        send_message(phone, "No encontré recordatorios activos.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  SCHEDULER — 100% gratis, sin IA
+#  SCHEDULER — revisa cada minuto, reenvía cada 30 min hasta finalizado
 # ──────────────────────────────────────────────────────────────────────────────
 
 def check_and_send():
     reminders = get_pending_reminders()
     for r in reminders:
         logging.info(f"Enviando recordatorio {r['id']} → {r['phone']}")
-        ok = send_message(r["phone"],
-            f"🔔 *Recordatorio:*\n\n{r['task']}\n\n"
-            "Responde *finalizado* cuando lo hayas completado.")
+        ok = send_reminder_with_button(r["phone"], r["task"], r["id"])
         if ok:
             mark_reminded(r["id"])
-            if r.get("repeat"):
+            if r.get("repeat") and r.get("status") == "pending":
                 schedule_next(r)
 
 
@@ -173,14 +179,10 @@ def check_endpoint():
     return "ok", 200
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  INICIO
-# ──────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     init_db()
     scheduler = BackgroundScheduler(timezone="America/Bogota")
     scheduler.add_job(check_and_send, "interval", minutes=1, id="check_reminders")
     scheduler.start()
-    logging.info("🤖 RemindBot activo (100% gratis)")
+    logging.info("RemindBot activo")
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
